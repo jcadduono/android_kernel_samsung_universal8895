@@ -182,6 +182,42 @@ static int regmap_i2c_read(void *context,
 	struct i2c_msg xfer[2];
 	int ret;
 
+	if (i2c->flags & I2C_CLIENT_TEN) {
+		xfer[0].flags = I2C_M_RD|I2C_CLIENT_TEN;
+		xfer[0].len = val_size;
+		xfer[0].buf = (void *)reg;
+		xfer[0].addr = xfer[0].buf[0] +
+			(((i2c->addr & 0x7f) << 8) & 0xff00);
+		xfer[0].buf = val;
+
+		ret = i2c_transfer(i2c->adapter, xfer, 1);
+
+		if (ret == 1)
+			return 0;
+		else if (ret < 0)
+			return ret;
+		else
+			return -EIO;
+	} else if (i2c->flags & I2C_CLIENT_SPEEDY) {
+		xfer[0].flags = I2C_M_RD|I2C_CLIENT_SPEEDY;
+		xfer[0].len = val_size;
+		xfer[0].buf = (void *)reg;
+		/*
+		 * The upper 4bit of 12bit speedy slave address is for device id.
+		 * 8bit is for device register offset.
+		 */
+		xfer[0].addr = xfer[0].buf[0] + ((i2c->addr & 0xf) << 8);
+		xfer[0].buf = val;
+
+		ret = i2c_transfer(i2c->adapter, xfer, 1);
+
+		if (ret == 1)
+			return 0;
+		else if (ret < 0)
+			return ret;
+		else
+			return -EIO;
+	} else {
 	xfer[0].addr = i2c->addr;
 	xfer[0].flags = 0;
 	xfer[0].len = reg_size;
@@ -199,6 +235,7 @@ static int regmap_i2c_read(void *context,
 		return ret;
 	else
 		return -EIO;
+}
 }
 
 static struct regmap_bus regmap_i2c = {

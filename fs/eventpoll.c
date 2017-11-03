@@ -310,7 +310,11 @@ struct ctl_table epoll_table[] = {
 
 static const struct file_operations eventpoll_fops;
 
+#if defined(CONFIG_SEC_FD_DETECT)
+int is_file_epoll(struct file *f)
+#else
 static inline int is_file_epoll(struct file *f)
+#endif
 {
 	return f->f_op == &eventpoll_fops;
 }
@@ -1588,7 +1592,7 @@ static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
 {
 	int res = 0, eavail, timed_out = 0;
 	unsigned long flags;
-	u64 slack = 0;
+	long slack = 0;
 	wait_queue_t wait;
 	ktime_t expires, *to = NULL;
 

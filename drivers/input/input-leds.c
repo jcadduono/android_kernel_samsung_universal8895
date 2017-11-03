@@ -121,11 +121,14 @@ static int input_leds_connect(struct input_handler *handler,
 	for_each_set_bit(led_code, dev->ledbit, LED_CNT) {
 		struct input_led *led = &leds->leds[led_no];
 
-		led->handle = &leds->handle;
-		led->code = led_code;
 
 		if (!input_led_info[led_code].name)
 			continue;
+		if (led_no >= num_leds)
+			break;
+
+		led->handle = &leds->handle;
+		led->code = led_code;
 
 		led->cdev.name = kasprintf(GFP_KERNEL, "%s::%s",
 					   dev_name(&dev->dev),

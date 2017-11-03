@@ -83,6 +83,9 @@ if INET
 source "net/ipv4/Kconfig"
 source "net/ipv6/Kconfig"
 source "net/netlabel/Kconfig"
+#ifdef CONFIG_MPTCP
+	source "net/mptcp/Kconfig"
+#endif
 
 endif # if INET
 
@@ -239,6 +242,7 @@ source "net/mpls/Kconfig"
 source "net/hsr/Kconfig"
 source "net/switchdev/Kconfig"
 source "net/l3mdev/Kconfig"
+source "net/ncm/Kconfig"
 
 config RPS
 	bool
@@ -394,3 +398,9 @@ endif   # if NET
 # Used by archs to tell that they support BPF_JIT
 config HAVE_BPF_JIT
 	bool
+
+# Cross Layer TCP
+config CLTCP
+	bool "Cross Layer TCP"
+	---help---
+	This feature implements Cross Layer TCP (CLTCP)

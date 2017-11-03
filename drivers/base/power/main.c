@@ -38,6 +38,10 @@
 #include "../base.h"
 #include "power.h"
 
+#ifdef CONFIG_SEC_DEBUG
+#include <linux/sec_debug.h>
+#endif
+
 typedef int (*pm_callback_t)(struct device *);
 
 /*
@@ -126,7 +130,6 @@ void device_pm_add(struct device *dev)
 {
 	pr_debug("PM: Adding info for %s:%s\n",
 		 dev->bus ? dev->bus->name : "No Bus", dev_name(dev));
-	device_pm_check_callbacks(dev);
 	mutex_lock(&dpm_list_mtx);
 	if (dev->parent && dev->parent->power.is_prepared)
 		dev_warn(dev, "parent %s should not be sleeping\n",
@@ -149,7 +152,6 @@ void device_pm_remove(struct device *dev)
 	mutex_unlock(&dpm_list_mtx);
 	device_wakeup_disable(dev);
 	pm_runtime_remove(dev);
-	device_pm_check_callbacks(dev);
 }
 
 /**
@@ -389,7 +391,9 @@ static int dpm_run_callback(pm_callback_t cb, struct device *dev,
 
 	pm_dev_dbg(dev, state, info);
 	trace_device_pm_callback_start(dev, info, state.event);
+	exynos_ss_suspend(cb, dev, ESS_FLAG_IN);
 	error = cb(dev);
+	exynos_ss_suspend(cb, dev, ESS_FLAG_OUT);
 	trace_device_pm_callback_end(dev, error);
 	suspend_report_result(cb, error);
 
@@ -421,8 +425,11 @@ static void dpm_watchdog_handler(unsigned long data)
 	struct dpm_watchdog *wd = (void *)data;
 
 	dev_emerg(wd->dev, "**** DPM device timeout ****\n");
+#ifdef CONFIG_SEC_DEBUG_EXTRA_INFO
+	sec_debug_set_extra_info_dpm_timeout(dev_name(wd->dev));
+#endif
 	show_stack(wd->tsk, NULL);
-	panic("%s %s: unrecoverable failure\n",
+	panic("DPM timeout(%s %s)\n",
 		dev_driver_string(wd->dev), dev_name(wd->dev));
 }
 
@@ -1577,11 +1584,6 @@ static int device_prepare(struct device *dev, pm_message_t state)
 
 	dev->power.wakeup_path = device_may_wakeup(dev);
 
-	if (dev->power.no_pm_callbacks) {
-		ret = 1;	/* Let device go direct_complete */
-		goto unlock;
-	}
-
 	if (dev->pm_domain) {
 		info = "preparing power domain ";
 		callback = dev->pm_domain->ops.prepare;
@@ -1604,7 +1606,6 @@ static int device_prepare(struct device *dev, pm_message_t state)
 	if (callback)
 		ret = callback(dev);
 
-unlock:
 	device_unlock(dev);
 
 	if (ret < 0) {
@@ -1733,30 +1734,3 @@ void dpm_for_each_dev(void *data, void (*fn)(struct device *, void *))
 	device_pm_unlock();
 }
 EXPORT_SYMBOL_GPL(dpm_for_each_dev);
-
-static bool pm_ops_is_empty(const struct dev_pm_ops *ops)
-{
-	if (!ops)
-		return true;
-
-	return !ops->prepare &&
-	       !ops->suspend &&
-	       !ops->suspend_late &&
-	       !ops->suspend_noirq &&
-	       !ops->resume_noirq &&
-	       !ops->resume_early &&
-	       !ops->resume &&
-	       !ops->complete;
-}
-
-void device_pm_check_callbacks(struct device *dev)
-{
-	spin_lock_irq(&dev->power.lock);
-	dev->power.no_pm_callbacks =
-		(!dev->bus || pm_ops_is_empty(dev->bus->pm)) &&
-		(!dev->class || pm_ops_is_empty(dev->class->pm)) &&
-		(!dev->type || pm_ops_is_empty(dev->type->pm)) &&
-		(!dev->pm_domain || pm_ops_is_empty(&dev->pm_domain->ops)) &&
-		(!dev->driver || pm_ops_is_empty(dev->driver->pm));
-	spin_unlock_irq(&dev->power.lock);
-}

@@ -592,6 +592,8 @@ static int mmc_decode_ext_csd(struct mmc_card *card, u8 *ext_csd)
 		card->ext_csd.ffu_capable =
 			(ext_csd[EXT_CSD_SUPPORTED_MODE] & 0x1) &&
 			!(ext_csd[EXT_CSD_FW_CONFIG] & 0x1);
+		card->ext_csd.enhanced_strobe_support =
+			ext_csd[EXT_CSD_STORBE_SUPPORT];
 	}
 out:
 	return err;
@@ -966,6 +968,9 @@ static int mmc_select_hs(struct mmc_card *card)
 {
 	int err;
 
+	if (card->en_strobe_enhanced)
+		mmc_select_bus_width(card);
+
 	err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
 			   EXT_CSD_HS_TIMING, EXT_CSD_TIMING_HS,
 			   card->ext_csd.generic_cmd6_time,
@@ -1063,6 +1068,7 @@ static int mmc_switch_status(struct mmc_card *card)
 static int mmc_select_hs400(struct mmc_card *card)
 {
 	struct mmc_host *host = card->host;
+	u32 ext_csd_bits;
 	bool send_status = true;
 	unsigned int max_dtr;
 	int err = 0;
@@ -1078,6 +1084,35 @@ static int mmc_select_hs400(struct mmc_card *card)
 	if (host->caps & MMC_CAP_WAIT_WHILE_BUSY)
 		send_status = false;
 
+	if(card->en_strobe_enhanced) {
+		ext_csd_bits = EXT_CSD_STROBE_ENHANCED_EN;
+
+		err = mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+				EXT_CSD_BUS_WIDTH,
+				EXT_CSD_DDR_BUS_WIDTH_8 | ext_csd_bits,
+				card->ext_csd.generic_cmd6_time);
+		if (err) {
+			pr_warn("%s: switch to bus width enhanced strobe failed, err:%d\n",
+					mmc_hostname(host), err);
+			return err;
+		}
+
+		err = __mmc_switch(card, EXT_CSD_CMD_SET_NORMAL,
+				EXT_CSD_HS_TIMING,
+				EXT_CSD_TIMING_HS400,
+				card->ext_csd.generic_cmd6_time,
+				true, true, true);
+		if (err) {
+			pr_warn("%s: switch to hs400 failed, err:%d\n",
+					mmc_hostname(host), err);
+			return err;
+		}
+		mmc_set_timing(host, MMC_TIMING_MMC_HS400_ES);
+	} else {
+		/*
+		 * Before switching to dual data rate operation for HS400,
+		 * it is required to convert from HS200 mode to HS mode.
+		 */
 	/* Reduce frequency to HS frequency */
 	max_dtr = card->ext_csd.hs_max_dtr;
 	mmc_set_clock(host, max_dtr);
@@ -1129,6 +1164,7 @@ static int mmc_select_hs400(struct mmc_card *card)
 
 	/* Set host controller to HS400 timing and frequency */
 	mmc_set_timing(host, MMC_TIMING_MMC_HS400);
+	}
 	mmc_set_bus_speed(card);
 
 	if (!send_status) {
@@ -1345,6 +1381,7 @@ bus_speed:
 static int mmc_hs200_tuning(struct mmc_card *card)
 {
 	struct mmc_host *host = card->host;
+	int err = 0;
 
 	/*
 	 * Timing should be adjusted to the HS400 target
@@ -1352,10 +1389,18 @@ static int mmc_hs200_tuning(struct mmc_card *card)
 	 */
 	if (card->mmc_avail_type & EXT_CSD_CARD_TYPE_HS400 &&
 	    host->ios.bus_width == MMC_BUS_WIDTH_8)
-		if (host->ops->prepare_hs400_tuning)
+		if (host->ops->prepare_hs400_tuning && !card->en_strobe_enhanced)
 			host->ops->prepare_hs400_tuning(host, &host->ios);
 
-	return mmc_execute_tuning(card);
+	if (host->ops->execute_tuning && !card->en_strobe_enhanced) {
+		err = mmc_execute_tuning(card);
+
+		if (err)
+			pr_warn("%s: tuning execution failed\n",
+					mmc_hostname(host));
+	}
+
+	return err;
 }
 
 /*
@@ -1502,6 +1547,8 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		mmc_set_erase_size(card);
 	}
 
+	card->en_strobe_enhanced = false;
+
 	/*
 	 * If enhanced_area_en is TRUE, host needs to enable ERASE_GRP_DEF
 	 * bit.  This bit will be lost every time after a reset or power off.
@@ -1567,13 +1614,38 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 	}
 
 	/*
+	 * Sequence for Enhanced Strobe
+	 *
+	 * 1. CMD6(BUS_WIDTH) with 8 bit SDR bus
+	 * 2. CMD6(HS_TIMING) with HS mode
+	 * 3. Set timing and clock as HS mode
+	 * 4. CMD6(BUS_WIDTH) with 8 bit DDR bus and enhanced strobe
+	 * 5. CMD6(HS_TIMING) with HS400 mode
+	 * 6. Set timing and clock as HS400 mode and enhanced strobe
+	 * 7. CMD6(POWER_CLASS) with 8 bit DDR bus and MMC_HS200_MAX_DTR
+	 */
+	if (card->ext_csd.enhanced_strobe_support &
+			MMC_STROBE_ENHANCED_SUPPORT) {
+		if (host->caps2 & MMC_CAP2_STROBE_ENHANCED &&
+				host->caps2 & MMC_CAP2_HS400) {
+			card->en_strobe_enhanced = true;
+			pr_warning("%s: STROBE ENHANCED enable\n",
+					mmc_hostname(card->host));
+		}
+	}
+
+	/*
 	 * Select timing interface
 	 */
 	err = mmc_select_timing(card);
 	if (err)
 		goto free_card;
 
-	if (mmc_card_hs200(card)) {
+	if (card->en_strobe_enhanced) {
+		err = mmc_select_hs400(card);
+		if (err)
+			goto free_card;
+	} else if (mmc_card_hs200(card)) {
 		err = mmc_hs200_tuning(card);
 		if (err)
 			goto free_card;

@@ -23,15 +23,27 @@
 #include <linux/atomic.h>
 #include <linux/scatterlist.h>
 #include <linux/rbtree.h>
+#include <linux/smc.h>
 #include <asm/page.h>
 #include <asm/unaligned.h>
 #include <crypto/hash.h>
 #include <crypto/md5.h>
 #include <crypto/algapi.h>
+#include <crypto/fmp.h>
 
 #include <linux/device-mapper.h>
 
 #define DM_MSG_PREFIX "crypt"
+#define FMP_KEY_STORAGE_OFFSET 0x0FC0
+#define EXYNOS8895_PA_SRAM_NS 0x0206F000
+#define FMP_SYSRAM_NS(soc) EXYNOS##soc##_PA_SRAM_NS
+
+volatile unsigned int disk_key_flag;
+DEFINE_SPINLOCK(disk_key_lock);
+
+#if defined(CONFIG_FIPS_FMP)
+extern int fmp_clear_disk_key(void);
+#endif
 
 /*
  * context holding the current state of a multi-part conversion
@@ -140,6 +152,9 @@ struct crypt_config {
 
 	char *cipher;
 	char *cipher_string;
+
+	/* hardware acceleration. 0 : no, 1 : yes */
+	unsigned int hw_fmp;
 
 	struct crypt_iv_operations *iv_gen_ops;
 	union {
@@ -1106,6 +1121,10 @@ static void crypt_endio(struct bio *clone)
 	unsigned rw = bio_data_dir(clone);
 	int error;
 
+	if (cc->hw_fmp) {
+		error = clone->bi_error;
+		bio_put(clone);
+	} else {
 	/*
 	 * free the processed pages
 	 */
@@ -1118,6 +1137,7 @@ static void crypt_endio(struct bio *clone)
 	if (rw == READ && !error) {
 		kcryptd_queue_crypt(io);
 		return;
+	}
 	}
 
 	if (unlikely(error))
@@ -1134,6 +1154,35 @@ static void clone_init(struct dm_crypt_io *io, struct bio *clone)
 	clone->bi_end_io  = crypt_endio;
 	clone->bi_bdev    = cc->dev->bdev;
 	clone->bi_rw      = io->base_bio->bi_rw;
+}
+
+
+static int kcryptd_io_rw(struct dm_crypt_io *io, gfp_t gfp)
+{
+	struct crypt_config *cc = io->cc;
+	struct bio *clone;
+
+	/*
+	 * The block layer might modify the bvec array, so always
+	 * copy the required bvecs because we need the original
+	 * one in order to decrypt the whole bio data *afterwards*.
+	 */
+	clone = bio_clone_fast(io->base_bio, gfp, cc->bs);
+	if (!clone)
+		return 1;
+
+	crypt_inc_pending(io);
+
+	clone_init(io, clone);
+	clone->private_enc_mode = FMP_DISK_ENC_MODE;
+	clone->private_enc_algo = FMP_XTS_ALGO_MODE;
+	clone->key = cc->key;
+	clone->key_length = cc->key_size;
+	clone->bi_iter.bi_sector = cc->start + io->sector;
+
+	generic_make_request(clone);
+
+	return 0;
 }
 
 static int kcryptd_io_read(struct dm_crypt_io *io, gfp_t gfp)
@@ -1396,12 +1445,27 @@ static void kcryptd_crypt(struct work_struct *work)
 		kcryptd_crypt_write_convert(io);
 }
 
+static void kcryptd_fmp_io(struct work_struct *work)
+{
+	struct dm_crypt_io *io = container_of(work, struct dm_crypt_io, work);
+
+	crypt_inc_pending(io);
+	if (kcryptd_io_rw(io, GFP_NOIO))
+		io->error = -ENOMEM;
+	crypt_dec_pending(io);
+}
+
 static void kcryptd_queue_crypt(struct dm_crypt_io *io)
 {
 	struct crypt_config *cc = io->cc;
 
+	if (cc->hw_fmp) {
+		INIT_WORK(&io->work, kcryptd_fmp_io);
+		queue_work(cc->io_queue, &io->work);
+	} else {
 	INIT_WORK(&io->work, kcryptd_crypt);
 	queue_work(cc->crypt_queue, &io->work);
+}
 }
 
 /*
@@ -1475,12 +1539,41 @@ static int crypt_setkey_allcpus(struct crypt_config *cc)
 	/* Ignore extra keys (which are used for IV etc) */
 	subkey_size = (cc->key_size - cc->key_extra_size) >> ilog2(cc->tfms_count);
 
+	if (cc->hw_fmp) {
+		uint32_t base;
+		volatile u8 __iomem *key_storage;
+
+		base = FMP_SYSRAM_NS(8895);
+		key_storage = ioremap(base + FMP_KEY_STORAGE_OFFSET, SZ_4K);
+		if (!key_storage) {
+			pr_err("dm-crypt: Failure of ioremap for FMP key\n");
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < cc->key_size; i++)
+			key_storage[i] = cc->key[i];
+
+		r = exynos_smc(SMC_CMD_FMP_DISKENC, FMP_DISKKEY_STORE,
+				ID_FMP_UFS_MMC, cc->key_size);
+		if (r) {
+			pr_err("dm-crypt: Fail to store FMP disk key. r = 0x%x\n", r);
+			iounmap((void *)key_storage);
+			return -ENOSYS;
+		}
+
+		spin_lock(&disk_key_lock);
+		disk_key_flag = 1;
+		spin_unlock(&disk_key_lock);
+
+		iounmap((void *)key_storage);
+	} else {
 	for (i = 0; i < cc->tfms_count; i++) {
 		r = crypto_ablkcipher_setkey(cc->tfms[i],
 					     cc->key + (i * subkey_size),
 					     subkey_size);
 		if (r)
 			err = r;
+	}
 	}
 
 	return err;
@@ -1523,6 +1616,9 @@ static int crypt_wipe_key(struct crypt_config *cc)
 
 static void crypt_dtr(struct dm_target *ti)
 {
+#if defined(CONFIG_FIPS_FMP)
+	int r;
+#endif
 	struct crypt_config *cc = ti->private;
 
 	ti->private = NULL;
@@ -1530,6 +1626,10 @@ static void crypt_dtr(struct dm_target *ti)
 	if (!cc)
 		return;
 
+	if (cc->io_queue)
+		destroy_workqueue(cc->io_queue);
+
+	if (!cc->hw_fmp) {
 	if (cc->write_thread) {
 		spin_lock_irq(&cc->write_thread_wait.lock);
 		set_bit(DM_CRYPT_EXIT_THREAD, &cc->flags);
@@ -1538,22 +1638,29 @@ static void crypt_dtr(struct dm_target *ti)
 		kthread_stop(cc->write_thread);
 	}
 
-	if (cc->io_queue)
-		destroy_workqueue(cc->io_queue);
 	if (cc->crypt_queue)
 		destroy_workqueue(cc->crypt_queue);
+	}
 
 	crypt_free_tfms(cc);
 
 	if (cc->bs)
 		bioset_free(cc->bs);
 
+	if (!cc->hw_fmp) {
 	mempool_destroy(cc->page_pool);
 	mempool_destroy(cc->req_pool);
 
 	if (cc->iv_gen_ops && cc->iv_gen_ops->dtr)
 		cc->iv_gen_ops->dtr(cc);
-
+	}
+#if defined(CONFIG_FIPS_FMP)
+	if (cc->hw_fmp) {
+		r = fmp_clear_disk_key();
+		if (r)
+			pr_err("dm-crypt: Fail to clear FMP disk key. r = 0x%x\n", r);
+	}
+#endif
 	if (cc->dev)
 		dm_put_device(ti, cc->dev);
 
@@ -1637,6 +1744,37 @@ static int crypt_ctr_cipher(struct dm_target *ti,
 		goto bad_mem;
 	}
 
+	if (!cipher) {
+		ti->error = "Error Invalid cipher";
+		ret = -EINVAL;
+		goto bad;
+	}
+
+	if ((strcmp(chainmode, "xts") == 0) &&
+			(strcmp(cipher, "aes") == 0) &&
+			(strcmp(ivmode, "fmp") == 0)) {
+		pr_info("%s: H/W FMP disk encryption\n", __func__);
+#if !defined(CONFIG_FMP_DM_CRYPT)
+		ti->error = "Error decoding xts-aes-fmp";
+		ret = -EINVAL;
+		goto bad;
+#endif
+		cc->hw_fmp = 1;
+
+		/* Initialize max_io_len */
+		ret = dm_set_target_max_io_len(ti, 1024);
+		if (ret < 0)
+			goto bad;
+
+		/* Initialize and set key */
+		ret = crypt_set_key(cc, key);
+		if (ret < 0) {
+			ti->error = "Error decoding and setting key";
+			goto bad;
+		}
+	} else {
+		pr_info("%s: S/W disk encryption\n", __func__);
+
 	/* Allocate cipher */
 	ret = crypt_alloc_tfms(cc, cipher_api);
 	if (ret < 0) {
@@ -1714,6 +1852,7 @@ static int crypt_ctr_cipher(struct dm_target *ti,
 			goto bad;
 		}
 	}
+	}
 
 	ret = 0;
 bad:
@@ -1763,6 +1902,10 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	if (ret < 0)
 		goto bad;
 
+	if (cc->hw_fmp) {
+		cc->per_bio_data_size = ti->per_bio_data_size =
+			ALIGN(sizeof(struct dm_crypt_io), ARCH_KMALLOC_MINALIGN);
+	} else {
 	cc->dmreq_start = sizeof(struct ablkcipher_request);
 	cc->dmreq_start += crypto_ablkcipher_reqsize(any_tfm(cc));
 	cc->dmreq_start = ALIGN(cc->dmreq_start, __alignof__(struct dm_crypt_request));
@@ -1798,6 +1941,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Cannot allocate page mempool";
 		goto bad;
 	}
+	}
 
 	cc->bs = bioset_create(MIN_IOS, 0);
 	if (!cc->bs) {
@@ -1807,12 +1951,14 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	mutex_init(&cc->bio_alloc_lock);
 
+	if (!cc->hw_fmp) {
 	ret = -EINVAL;
 	if (sscanf(argv[2], "%llu%c", &tmpll, &dummy) != 1) {
 		ti->error = "Invalid iv_offset sector";
 		goto bad;
 	}
 	cc->iv_offset = tmpll;
+	}
 
 	ret = dm_get_device(ti, argv[3], dm_table_get_mode(ti->table), &cc->dev);
 	if (ret) {
@@ -1864,15 +2010,24 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	ret = -ENOMEM;
+	if (cc->hw_fmp) {
+		cc->io_queue = alloc_workqueue("kcryptd_fmp_io",
+						WQ_HIGHPRI |
+						WQ_MEM_RECLAIM,
+						1);
+	} else {
 	cc->io_queue = alloc_workqueue("kcryptd_io",
 				       WQ_HIGHPRI |
 				       WQ_MEM_RECLAIM,
 				       1);
+	}
+
 	if (!cc->io_queue) {
 		ti->error = "Couldn't create kcryptd io queue";
 		goto bad;
 	}
 
+	if (!cc->hw_fmp) {
 	if (test_bit(DM_CRYPT_SAME_CPU, &cc->flags))
 		cc->crypt_queue = alloc_workqueue("kcryptd",
 						  WQ_HIGHPRI |
@@ -1899,6 +2054,7 @@ static int crypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 	wake_up_process(cc->write_thread);
+	}
 
 	ti->num_flush_bios = 1;
 	ti->discard_zeroes_data_unsupported = true;
@@ -1932,11 +2088,16 @@ static int crypt_map(struct dm_target *ti, struct bio *bio)
 	crypt_io_init(io, cc, bio, dm_target_offset(ti, bio->bi_iter.bi_sector));
 	io->ctx.req = (struct ablkcipher_request *)(io + 1);
 
+	if (cc->hw_fmp) {
+		if (kcryptd_io_rw(io, GFP_NOWAIT))
+			kcryptd_queue_crypt(io);
+	} else {
 	if (bio_data_dir(io->base_bio) == READ) {
 		if (kcryptd_io_read(io, GFP_NOWAIT))
 			kcryptd_queue_read(io);
 	} else
 		kcryptd_queue_crypt(io);
+	}
 
 	return DM_MAPIO_SUBMITTED;
 }
