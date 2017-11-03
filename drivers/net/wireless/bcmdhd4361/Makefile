@@ -287,12 +287,6 @@ DHDCFLAGS += -DDHD_BLOB_EXISTENCE_CHECK
 # Random mac scan
 DHDCFLAGS += -DSUPPORT_RANDOM_MAC_SCAN
 
-# Android Version Check from Platform source
-ifneq ($(PLATFORM_VERSION),)
-MAJOR_VERSION := $(shell echo $(PLATFORM_VERSION) | cut -d "." -f 1)
-DHDCFLAGS += -DANDROID_PLATFORM_VERSION=$(MAJOR_VERSION)
-endif
-
 ##############################
 # Android Platform Definition
 ##############################
