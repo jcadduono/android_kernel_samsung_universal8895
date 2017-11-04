@@ -6,7 +6,22 @@ obj-y                          := main.o version.o mounts.o
 ifeq ($(CONFIG_TIMA_RKP), y)
 obj-y += _vmm.o vmm.o
 obj-y += ld.o
+
+ifeq ($(CONFIG_RKP_6G), y)
+$(obj)/_vmm.o: $(obj)/vmm.6g.elf
+else
+$(obj)/_vmm.o: $(obj)/vmm.elf
 endif
+
+quiet_cmd_ihex  = IHEX    $@
+      cmd_ihex  = $(OBJCOPY) -Iihex -Obinary $< $@
+
+# .ihex is used just as a simple way to hold binary files in a source tree
+# where binaries are frowned upon. They are directly converted with objcopy.
+$(obj)/%: $(obj)/%.ihex
+	$(call cmd,ihex)
+endif
+
 obj-y                          += noinitramfs.o
 obj-$(CONFIG_BLK_DEV_INITRD)   += initramfs.o
 obj-$(CONFIG_GENERIC_CALIBRATE_DELAY) += calibrate.o
