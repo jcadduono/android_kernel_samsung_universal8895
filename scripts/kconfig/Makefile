@@ -15,6 +15,14 @@ ifeq ($(quiet),silent_)
 silent := -s
 endif
 
+ifneq ($(DEVICE_DEFCONFIG),)
+export KCONFIG_DEVICE := arch/$(SRCARCH)/configs/$(DEVICE_DEFCONFIG)
+endif
+
+ifneq ($(EXTRA_DEFCONFIG),)
+export KCONFIG_EXTRA := arch/$(SRCARCH)/configs/$(EXTRA_DEFCONFIG)
+endif
+
 # We need this, in case the user has it in its environment
 unexport CONFIG_
 

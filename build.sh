@@ -54,12 +54,17 @@ while [ $# != 0 ]; do
 	shift
 done
 
-[ "$DEVICE" ] || DEVICE=eur_open
-[ "$TARGET" ] || TARGET=exynos8895-greatlte
-DEFCONFIG=${TARGET}_${DEVICE}_defconfig
+[ "$TARGET" ] || TARGET=samsung_exynos8895
+[ "$DEVICE" ] || DEVICE=greatlte_eur
+
+DEFCONFIG=${TARGET}_defconfig
+DEVICE_DEFCONFIG=device_${DEVICE}
 
 [ -f "$RDIR/arch/$ARCH/configs/${DEFCONFIG}" ] ||
 ABORT "Config $DEFCONFIG not found in $ARCH configs!"
+
+[ -f "$RDIR/arch/$ARCH/configs/${DEVICE_DEFCONFIG}" ] ||
+ABORT "Device config $DEVICE_DEFCONFIG not found in $ARCH configs!"
 
 export LOCALVERSION=$TARGET-$DEVICE-$VER
 
@@ -72,6 +77,7 @@ SETUP_BUILD() {
 	echo "Creating kernel config for $LOCALVERSION..."
 	mkdir -p build
 	make -C "$RDIR" O=build "$DEFCONFIG" \
+		DEVICE_DEFCONFIG="$DEVICE_DEFCONFIG" \
 		|| ABORT "Failed to set up build"
 }
 

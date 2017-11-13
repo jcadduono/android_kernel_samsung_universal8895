@@ -21,21 +21,18 @@ export CROSS_COMPILE=$TOOLCHAIN/bin/aarch64-linux-gnu-
 ABORT "Unable to find gcc cross-compiler at location: ${CROSS_COMPILE}gcc"
 
 while [ $# != 0 ]; do
-	if [ ! "$DEVICE" ]; then
-		DEVICE=$1
-	elif [ ! "$TARGET" ]; then
+	if [ ! "$TARGET" ]; then
 		TARGET=$1
 	else
 		echo "Too many arguments!"
-		echo "Usage: ./menuconfig.sh [device] [target defconfig]"
+		echo "Usage: ./menuconfig.sh [target defconfig]"
 		ABORT
 	fi
 	shift
 done
 
-[ "$DEVICE" ] || DEVICE=eur_open
-[ "$TARGET" ] || TARGET=exynos8895-greatlte
-DEFCONFIG=${TARGET}_${DEVICE}_defconfig
+[ "$TARGET" ] || TARGET=samsung_exynos8895
+DEFCONFIG=${TARGET}_defconfig
 DEFCONFIG_FILE=$RDIR/arch/$ARCH/configs/$DEFCONFIG
 
 [ -f "$DEFCONFIG_FILE" ] ||
